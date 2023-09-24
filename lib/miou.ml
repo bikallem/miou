@@ -186,12 +186,12 @@ module Promise = struct
         if not set then consume ~backoff:(Backoff.once backoff) prm
     | _ -> failwith "Promise.consume: Invalid transition"
 
-  let rec cancel ?(backoff = Backoff.default) prm =
+  let rec cancel_with ?(backoff = Backoff.default) ~exn prm =
     match Atomic.get prm.state with
     | (Pending | Resolved _ | Failed _) as state ->
-        let consumed = Consumed (Error Cancelled) in
+        let consumed = Consumed (Error exn) in
         let set = Atomic.compare_and_set prm.state state consumed in
-        if not set then cancel ~backoff:(Backoff.once backoff) prm
+        if not set then cancel_with ~backoff:(Backoff.once backoff) ~exn prm
     | Consumed _ -> ()
 
   let is_cancelled prm =
@@ -275,6 +275,7 @@ type _ Effect.t += Domain_count : int Effect.t
 type _ Effect.t += Spawn : ty * resource list * (unit -> 'a) -> 'a t Effect.t
 type _ Effect.t += Yield : unit Effect.t
 type _ Effect.t += Cancel : 'a t -> unit Effect.t
+type _ Effect.t += Cancel_with : exn * 'a t -> unit Effect.t
 type _ Effect.t += Domains : Domain_uid.t list Effect.t
 type _ Effect.t += Random : Random.State.t Effect.t
 
@@ -297,7 +298,7 @@ type _ Effect.t += Ownership : 'a ownership -> 'a Effect.t
 type task =
   | Arrived : 'a t * (unit -> 'a) -> task
   | Suspended : 'a t * 'a State.t -> task
-  | Cancelled : 'a t -> task
+  | Cancelled : exn * 'a t -> task
   | Tick : task
 
 and system =
@@ -317,7 +318,7 @@ and domain = {
   ; tick: int Atomic.t
 }
 
-and elt = Task : 'a t * (unit -> 'a) -> elt | Cancel : 'a t -> elt
+and elt = Task : 'a t * (unit -> 'a) -> elt | Cancel : exn * 'a t -> elt
 
 and pool = {
     tasks: elt Sequence.t
@@ -395,7 +396,7 @@ module Domain = struct
           if Promise_uid.equal prm.uid uid then tasks := task :: !tasks
       | Suspended (prm, _) ->
           if Promise_uid.equal prm.uid uid then tasks := task :: !tasks
-      | Cancelled prm ->
+      | Cancelled (_, prm) ->
           if Promise_uid.equal prm.uid uid then tasks := task :: !tasks
       | Tick -> ()
     in
@@ -421,7 +422,7 @@ module Domain = struct
   let task_is_cancelled = function
     | Arrived (prm, _) -> Promise.is_cancelled prm
     | Suspended (prm, _) -> Promise.is_cancelled prm
-    | Cancelled prm -> Promise.is_cancelled prm
+    | Cancelled (_, prm) -> Promise.is_cancelled prm
     | Tick -> false
 
   let pack_is_cancelled (Pack prm) = Promise.is_cancelled prm
@@ -449,19 +450,19 @@ module Domain = struct
      need to add the cancellation task to our heap and reschedule.
 
      Note that cancellation tasks take priority. *)
-  let terminate pool domain (Pack prm) =
+  let terminate pool domain ?(exn : exn = Cancelled) (Pack prm) =
     if not (Domain_uid.equal prm.runner domain.uid) then (
       let domain' =
         List.find
           (fun domain -> Domain_uid.equal prm.runner domain.uid)
           pool.domains
       in
-      add_into_pool pool (Cancel prm);
+      add_into_pool pool (Cancel (exn, prm));
       Logs.debug (fun m ->
           m "[%a] signals the cancellation of %a to [%a]" Domain_uid.pp
             domain.uid Promise.pp prm Domain_uid.pp domain'.uid);
       interrupt ~domain:domain')
-    else add_task domain (Cancelled prm)
+    else add_task domain (Cancelled (exn, prm))
 
   (* XXX(dinosaure): Promises can end with "uncatchable" exceptions. This means
      that these exceptions terminate the program in any case. The user cannot
@@ -906,7 +907,7 @@ module Domain = struct
           let perform = perform pool domain (Promise.pack prm) in
           let state = State.run ~quanta:domain.quanta ~perform state in
           handle pool domain prm state
-      | Cancelled prm -> (
+      | Cancelled (exn, prm) -> (
           Logs.debug (fun m ->
               m "[%a] %a cancelled" Domain_uid.pp domain.uid Promise.pp prm);
           clean_system_tasks domain prm;
@@ -914,12 +915,12 @@ module Domain = struct
           | [ Suspended (_, state) ] ->
               Queue.iter ~f:(terminate pool domain) prm.children;
               let _state = State.fail ~exn:Cancelled state in
-              Promise.transition prm (Error Cancelled);
+              Promise.transition prm (Error exn);
               Promise.consume prm
           | [ Arrived (prm, _) ] ->
-              Promise.transition prm (Error Cancelled);
+              Promise.transition prm (Error exn);
               Promise.consume prm
-          | [] -> Promise.cancel prm
+          | [] -> Promise.cancel_with ~exn prm
           | _ -> assert false)
 
   let unblock_awaits_with_system_tasks pool domain =
@@ -945,7 +946,7 @@ module Domain = struct
     let f = function
       | Task (prm, _) when Domain_uid.equal prm.runner domain.uid ->
           raise_notrace Yes
-      | Cancel prm when Domain_uid.equal prm.runner domain.uid ->
+      | Cancel (_, prm) when Domain_uid.equal prm.runner domain.uid ->
           raise_notrace Yes
       | _ -> ()
     in
@@ -975,7 +976,7 @@ module Pool = struct
     let exception Task of elt Sequence.node in
     let f node =
       match Sequence.data node with
-      | Cancel prm when Domain_uid.equal prm.runner domain.uid ->
+      | Cancel (_, prm) when Domain_uid.equal prm.runner domain.uid ->
           raise_notrace (Task node)
       | Task (prm, _) when Domain_uid.equal prm.runner domain.uid ->
           raise_notrace (Task node)
@@ -987,7 +988,7 @@ module Pool = struct
       Sequence.remove node;
       begin
         match data with
-        | Cancel prm -> Domain.add_task domain (Cancelled prm)
+        | Cancel (exn, prm) -> Domain.add_task domain (Cancelled (exn, prm))
         | Task (prm, fn) -> Domain.add_task domain (Arrived (prm, fn))
       end;
       transfer_all_tasks pool domain
@@ -1144,6 +1145,7 @@ let suspend syscall = Effect.perform (Suspend syscall)
 let await prm = Effect.perform (Await prm)
 let yield () = Effect.perform Yield
 let cancel prm = Effect.perform (Cancel prm)
+let cancel_with ~exn prm = Effect.perform (Cancel_with (exn, prm))
 let await_all prms = Effect.perform (Await_all prms)
 let uid (Syscall (uid, _) : _ syscall) = uid
 

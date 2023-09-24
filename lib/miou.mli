@@ -782,6 +782,9 @@ val cancel : 'a t -> unit
     which should not affect the opportunity for other concurrent tasks to run.
 *)
 
+val cancel_with : exn:exn -> 'a t -> unit
+(** [cancel_with ~exn prm] cancels the given promise with an user's exception. *)
+
 type handler = { handler: 'a 'b. ('a -> 'b) -> 'a -> 'b } [@@unboxed]
 (** {2 Composition.}
 
