@@ -379,6 +379,22 @@ module Ownership : sig
   (** [check t] verifies that the given resource [t] is owned by the current
       task. If a task tries to use a resource that does not belong to it,
       {!val:check} will raise an {i uncatchable} exception [Not_owner]. *)
+
+  val copy : t -> t
+  (** [copy t] returns the same resource (with the same {i finaliser}) with a
+      different internal unique ID. When the user [give] a resource to a
+      promise, Miou {i disown} this resource from the current task which launch
+      a new one - and pass the resource to the new one.
+
+      It's possible to share the resource between a task and its children via:
+
+      {[
+        let give' = List.map Miou.Ownership.copy give in
+        let prm = Miou.call_cc ~give:give' @@ fun () ->
+          List.map Miou.Ownership.disown give' in
+        Miou.await_exn prm;
+        List.map Miou.Ownership.disown give
+      ]} *)
 end
 
 type 'a t

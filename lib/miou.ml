@@ -134,6 +134,9 @@ module Resource = struct
     Resource { uid; value; finaliser }
 
   let equal (Resource { uid= a; _ }) (Resource { uid= b; _ }) = Uid.equal a b
+
+  let copy (Resource { value; finaliser; _ }) =
+    Resource { value; finaliser; uid= Uid.gen () }
 end
 
 (** Promise *)
@@ -260,7 +263,10 @@ module Promise = struct
     let check (Pack prm') =
       match Atomic.get prm'.state with
       | Consumed _ | Failed Cancelled -> ()
-      | _ -> result := true
+      | _ ->
+          Logs.debug (fun m ->
+              m "%a (launched by %a) is pending" pp prm' pp prm);
+          result := true
     in
     Queue.iter ~f:check prm.children;
     not !result
@@ -674,6 +680,8 @@ module Domain = struct
         else k (State.Fail Not_owner)
     | Transfer (Resource { uid; _ } as res) ->
         if own_it prm res then begin
+          Logs.debug (fun m ->
+              m "%a transfers [%a]" Promise.pp prm Resource_uid.pp uid);
           match prm.parent with
           | None -> k (State.Fail (error_impossible_to_transfer prm))
           | Some (Pack prm') ->
@@ -1113,6 +1121,7 @@ module Ownership = struct
   let disown res = Effect.perform (Ownership (Disown res))
   let transfer res = Effect.perform (Ownership (Transfer res))
   let check res = Effect.perform (Ownership (Check res))
+  let copy res = Resource.copy res
 end
 
 let domains () = Effect.perform Domains
@@ -1134,7 +1143,11 @@ let care t =
         ready := Some node;
         raise_notrace Found
   in
-  try Sequence.iter_node ~f t; None
+  Logs.debug (fun m -> m "%d children" (Sequence.length t));
+  try
+    Sequence.iter_node ~f t;
+    Logs.debug (fun m -> m "no children are ready to be consumed");
+    None
   with Found ->
     let[@warning "-8"] (Some node) = !ready in
     let data = Sequence.data node in
